@@ -8,7 +8,7 @@ import Vision
 final class GazeDetector {
     private let minFrameInterval: CFTimeInterval = 1.0 / 15.0 // 15 fps
     private var lastProcessedTime: CFTimeInterval = 0
-    
+
     /// Called once per processed frame with the latest observation.
     /// Marked `@MainActor @Sendable` rather than a plain closure type:
     /// `@MainActor` tells the compiler this closure only ever runs on
@@ -28,14 +28,17 @@ final class GazeDetector {
     /// connection, or support device rotation.
     private let orientation: CGImagePropertyOrientation = .right
 
+    /// Below this, a single eye's reading is treated as unusable (e.g. a
+    /// blink) rather than included at near-zero weight. Tune against logged
+    /// EAR values from Stage 3 rather than trusting this number blindly.
     private let minUsableConfidence: Double = 0.15
     private let calibration = GazeCalibrationParameters()
 
-    /// Assumed comfortable range of eye rotation within the socket, used only
-    /// to convert Stage 4's unitless -1...1 offset into degrees so it can be
-    /// added to head yaw/pitch. This is a rough approximation, not a measured
-    /// biomechanical constant — tune it against your own logged data.
-    private let assumedMaxEyeRotationDegrees: CGFloat = 30
+    /// Head yaw/pitch beyond this (radians, ~35°) is clamped before undoing
+    /// foreshortening in Stage 3. Past this angle the flat-eye approximation
+    /// breaks down and Vision's pose estimate gets noisy, so the correction
+    /// would amplify error rather than remove it.
+    private let maxForeshorteningAngle: CGFloat = 35 * .pi / 180
 
     /// IMPORTANT: this method assumes it is always invoked back-to-back
     /// from the same serial queue AVFoundation delivers frames on. That's
@@ -89,7 +92,6 @@ private extension GazeDetector {
         handleFace(primaryFace, landMarks: landmarks, timestamp: timestamp, imageDimensions: imageDimensions)
     }
 
-
     func reportNoFace() {
         gazeSmoother.reset()
         emit(.noFace)
@@ -98,46 +100,63 @@ private extension GazeDetector {
     func handleFace(_ face: VNFaceObservation, landMarks: VNFaceLandmarks2D, timestamp: CFTimeInterval, imageDimensions: (width: CGFloat, height: CGFloat)) {
         let faceBox = face.boundingBox
         let aspectCorrection = imageDimensions.height / imageDimensions.width
+        let pose = headPose(from: face)
 
-        var leftReading: EyeReading?
-        if let leftEye = landMarks.leftEye, let leftPupil = landMarks.leftPupil {
-            leftReading = eyeReading(pupil: leftPupil, eyeContour: leftEye, faceBox: faceBox, aspectCorrection: aspectCorrection)
+        let leftEye = eyeGeometry(contour: landMarks.leftEye, pupil: landMarks.leftPupil, faceBox: faceBox, aspectCorrection: aspectCorrection)
+        let rightEye = eyeGeometry(contour: landMarks.rightEye, pupil: landMarks.rightPupil, faceBox: faceBox, aspectCorrection: aspectCorrection)
+
+        guard let faceAxis = faceAxis(left: leftEye, right: rightEye) else {
+            reportNoFace()
+            return
         }
-        var rightReading: EyeReading?
-        if let rightEye = landMarks.rightEye, let rightPupil = landMarks.rightPupil {
-            rightReading = eyeReading(pupil: rightPupil, eyeContour: rightEye, faceBox: faceBox, aspectCorrection: aspectCorrection)
-        }
+
+        let leftReading = leftEye.map { eyeReading($0, faceAxis: faceAxis, pose: pose) }
+        let rightReading = rightEye.map { eyeReading($0, faceAxis: faceAxis, pose: pose) }
 
         guard let combinedEyeReading = combine(left: leftReading, right: rightReading) else {
             reportNoFace()
             return
         }
 
-        let pose = headPose(from: face)
-        let estimate = gazeEstimate(eyeReading: combinedEyeReading, pose: pose)
+        let facePosition = CGPoint(x: faceBox.midX, y: faceBox.midY * aspectCorrection)
+        let estimate = gazeEstimate(eyeReading: combinedEyeReading, pose: pose, faceAxis: faceAxis, facePosition: facePosition)
         let smoothedEstimate = gazeSmoother.update(with: estimate, at: timestamp)
-        
+
         let classification = gazeZoneClassifier.classify(
             horizontalAngle: smoothedEstimate.horizontalAngle,
             verticalAngle: smoothedEstimate.verticalAngle,
             timestamp: timestamp
         )
-        
+
         let reading = GazeReading(
             gaze: classification.zone,
             horizontalAngle: smoothedEstimate.horizontalAngle,
             verticalAngle: smoothedEstimate.verticalAngle,
             confidence: smoothedEstimate.confidence,
+            head: smoothedEstimate.head,
             timeSinceCentered: classification.timeSinceCentered,
             timestamp: timestamp
         )
-        
+
         emit(.detected(reading))
     }
 }
 
 // MARK: - Stage 3
+
 private extension GazeDetector {
+    /// One eye's landmarks in image space, before anything is measured
+    /// relative to the face's orientation.
+    struct EyeGeometry {
+        let contour: [CGPoint]
+        let pupilCenter: CGPoint
+        /// Midpoint between the two eye corners.
+        let center: CGPoint
+        /// Unit vector from corner to corner, pointing toward larger image-x.
+        let cornerAxis: CGPoint
+        let halfWidth: CGFloat
+    }
+
     func imagePoint(from region: VNFaceLandmarkRegion2D, faceBox: CGRect, aspectCorrection: CGFloat) -> [CGPoint] {
         region.normalizedPoints.map { point in
             let x = faceBox.origin.x + point.x * faceBox.width
@@ -152,8 +171,8 @@ private extension GazeDetector {
 
         var best: (CGPoint, CGPoint, CGFloat) = (eyePoints[0], eyePoints[0], 0)
 
-        for i in 0..<eyePoints.count {
-            for j in (i + 1)..<eyePoints.count {
+        for i in 0 ..< eyePoints.count {
+            for j in (i + 1) ..< eyePoints.count {
                 let dx = eyePoints[i].x - eyePoints[j].x
                 let dy = eyePoints[i].y - eyePoints[j].y
                 let distSq = dx * dx + dy * dy
@@ -179,90 +198,144 @@ private extension GazeDetector {
         a.x * b.x + a.y * b.y
     }
 
-    func eyeReading(
-        pupil: VNFaceLandmarkRegion2D,
-        eyeContour: VNFaceLandmarkRegion2D,
+    func eyeGeometry(
+        contour: VNFaceLandmarkRegion2D?,
+        pupil: VNFaceLandmarkRegion2D?,
         faceBox: CGRect,
         aspectCorrection: CGFloat
-    ) -> EyeReading? {
+    ) -> EyeGeometry? {
+        guard let contour, let pupil else { return nil }
 
-        let eyePoints = imagePoint(from: eyeContour, faceBox: faceBox, aspectCorrection: aspectCorrection)
+        let eyePoints = imagePoint(from: contour, faceBox: faceBox, aspectCorrection: aspectCorrection)
         let pupilPoints = imagePoint(from: pupil, faceBox: faceBox, aspectCorrection: aspectCorrection)
 
         guard !pupilPoints.isEmpty else { return nil }
-        
+
         guard let (cornerA, cornerB) = corners(of: eyePoints) else { return nil }
-        
-//        print("cornerA: \(cornerA), cornerB: \(cornerB)")
 
-        let pupilCenter = CGPoint(
-            x: pupilPoints.map(\.x).reduce(0, +) / CGFloat(pupilPoints.count),
-            y: pupilPoints.map(\.y).reduce(0, +) / CGFloat(pupilPoints.count)
+        let halfWidth = sqrt(pow(cornerB.x - cornerA.x, 2) + pow(cornerB.y - cornerA.y, 2)) / 2
+        guard halfWidth > 0 else { return nil }
+
+        return EyeGeometry(
+            contour: eyePoints,
+            pupilCenter: CGPoint(
+                x: pupilPoints.map(\.x).reduce(0, +) / CGFloat(pupilPoints.count),
+                y: pupilPoints.map(\.y).reduce(0, +) / CGFloat(pupilPoints.count)
+            ),
+            center: CGPoint(
+                x: (cornerA.x + cornerB.x) / 2,
+                y: (cornerA.y + cornerB.y) / 2
+            ),
+            cornerAxis: normalize(canonicalAxis(cornerA: cornerA, cornerB: cornerB)),
+            halfWidth: halfWidth
         )
+    }
 
-        let eyeCenter = CGPoint(
-            x: (cornerA.x + cornerB.x) / 2,
-            y: (cornerA.y + cornerB.y) / 2
-        )
+    /// The face's horizontal axis in the image: the line through both eye
+    /// centers, as in Zhang et al.'s data normalization (ETRA 2018). Its
+    /// angle is the head's roll as the camera sees it, measured in our own
+    /// image coordinates — so unlike Vision's roll there's no sign convention
+    /// to get wrong. Both eyes are measured along this one shared axis, which
+    /// is steadier than each eye's own short corner line. Falls back to that
+    /// corner line when only one eye was found.
+    func faceAxis(left: EyeGeometry?, right: EyeGeometry?) -> CGPoint? {
+        switch (left, right) {
+        case let (l?, r?):
+            let axis = normalize(canonicalAxis(cornerA: l.center, cornerB: r.center))
+            return axis == .zero ? l.cornerAxis : axis
+        case let (l?, nil):
+            return l.cornerAxis
+        case let (nil, r?):
+            return r.cornerAxis
+        case (nil, nil):
+            return nil
+        }
+    }
 
-        let axis = normalize(canonicalAxis(cornerA: cornerA, cornerB: cornerB))
-
-        let perpendicular = CGPoint(x: -axis.y, y: axis.x) // rotate 90°
-
-        let halfAxisLength = sqrt(pow(cornerB.x - cornerA.x, 2) + pow(cornerB.y - cornerA.y, 2)) / 2
-        guard halfAxisLength > 0 else { return nil }
+    /// Measures the pupil's offset in the face's own frame — `faceAxis` and
+    /// its perpendicular — so tilting the head doesn't change the reading.
+    func eyeReading(_ eye: EyeGeometry, faceAxis: CGPoint, pose: HeadPose) -> EyeReading {
+        let perpendicular = CGPoint(x: -faceAxis.y, y: faceAxis.x) // rotate 90°
 
         let offset = CGPoint(
-            x: pupilCenter.x - eyeCenter.x,
-            y: pupilCenter.y - eyeCenter.y
+            x: eye.pupilCenter.x - eye.center.x,
+            y: eye.pupilCenter.y - eye.center.y
         )
 
-        let horizontal = dot(offset, axis) / halfAxisLength
+        // Yaw shrinks both this offset and the eye width we divide by, so it
+        // cancels out here.
+        let horizontal = dot(offset, faceAxis) / eye.halfWidth
+
         // Eye height is a fraction of its width in practice; this scale factor
         // is an approximation, revisit if vertical readings feel too sensitive.
+        // Pitch shrinks vertical pupil movement by cos(pitch) but leaves the
+        // width alone, so divide that back out.
+        let pitch = min(abs(pose.pitch ?? 0), maxForeshorteningAngle)
+        let vertical = dot(offset, perpendicular) / (eye.halfWidth * 0.5) / cos(pitch)
 
-        let vertical = dot(offset, perpendicular) / (halfAxisLength * 0.5)
-
-        let confidence = eyeOpenness(eyePoints)
+        let confidence = eyeOpenness(
+            eye.contour,
+            eyeCenter: eye.center,
+            perpendicular: perpendicular,
+            width: eye.halfWidth * 2,
+            pose: pose
+        )
 
         return EyeReading(horizontalOffset: horizontal, verticalOffset: vertical, confidence: confidence)
     }
 
     /// Eye Aspect Ratio, adapted from Soukupová & Čech's blink-detection
-    /// approach: ratio of vertical eye extent to horizontal extent. Drops
-    /// sharply during a blink, which we use as a simple confidence signal.
-    func eyeOpenness(_ eyePoints: [CGPoint]) -> Double {
-        guard eyePoints.count >= 4, let (cornerA, cornerB) = corners(of: eyePoints) else { return 0 }
+    /// approach: ratio of eye height to eye width. Drops sharply during a
+    /// blink, which we use as a simple confidence signal.
+    ///
+    /// Head-pose compensation:
+    /// - Roll (tilting the head sideways): height is measured along the
+    ///   face's perpendicular axis, not image-y, so it doesn't change as
+    ///   the eye rotates in the image. Measuring image-y instead made a
+    ///   tilted open eye read as wide open, hiding blinks.
+    /// - Yaw/pitch (turning/nodding): these foreshorten the eye's width by
+    ///   cos(yaw) and height by cos(pitch), so the observed ratio is scaled
+    ///   by cos(pitch) / cos(yaw). Multiplying by the inverse undoes that,
+    ///   e.g. looking down at the phone no longer reads as a half-closed eye.
+    func eyeOpenness(
+        _ eyePoints: [CGPoint],
+        eyeCenter: CGPoint,
+        perpendicular: CGPoint,
+        width: CGFloat,
+        pose: HeadPose
+    ) -> Double {
+        guard eyePoints.count >= 4, width > 0 else { return 0 }
 
-        let width = sqrt(pow(cornerB.x - cornerA.x, 2) + pow((cornerB.y - cornerA.y), 2))
-        guard width > 0 else { return 0 }
+        let projections = eyePoints.map { point in
+            dot(CGPoint(x: point.x - eyeCenter.x, y: point.y - eyeCenter.y), perpendicular)
+        }
+        let height = (projections.max() ?? 0) - (projections.min() ?? 0)
 
-        let ys = eyePoints.map(\.y)
-        let height = (ys.max() ?? 0) - (ys.min() ?? 0)
+        let yaw = min(abs(pose.yaw ?? 0), maxForeshorteningAngle)
+        let pitch = min(abs(pose.pitch ?? 0), maxForeshorteningAngle)
+        let foreshortening = cos(yaw) / cos(pitch)
 
-        let ear = Double(height / width)
+        let ear = Double(height / width * foreshortening)
         // Typical open-eye EAR is roughly 0.2–0.35; tune against your own
         // logged values rather than trusting this number blindly.
 
         return min(1.0, max(0.0, ear / 0.3))
     }
 
-    /// Ensures the eye's axis vector always points toward larger image-x,
-    /// regardless of which corner the distance search happened to return
-    /// first. Without this, left and right eye readings can end up with
-    /// inconsistent sign conventions purely by iteration-order accident.
+    /// Ensures an axis vector always points toward larger image-x,
+    /// regardless of which end point happened to come first (e.g. which
+    /// corner the distance search returned). Without this, left and right
+    /// eye readings can end up with inconsistent sign conventions purely by
+    /// iteration-order accident.
     func canonicalAxis(cornerA: CGPoint, cornerB: CGPoint) -> CGPoint {
         let raw = CGPoint(x: cornerB.x - cornerA.x, y: cornerB.y - cornerA.y)
         return raw.x >= 0 ? raw : CGPoint(x: -raw.x, y: -raw.y)
     }
 }
 
+// MARK: Stage 4
 
-//MARK: Stage 4
 private extension GazeDetector {
-    /// Below this, a single eye's reading is treated as unusable (e.g. a
-    /// blink) rather than included at near-zero weight. Tune against logged
-    /// EAR values from Stage 3 rather than trusting this number blindly: minUsableConfidence
     func combine(left: EyeReading?, right: EyeReading?) -> CombinedGazeReading? {
         let usableLeft = left.flatMap { $0.confidence >= minUsableConfidence ? $0 : nil }
         let usableRight = right.flatMap { $0.confidence >= minUsableConfidence ? $0 : nil }
@@ -270,10 +343,9 @@ private extension GazeDetector {
         switch (usableLeft, usableRight) {
         case (nil, nil):
             return nil
-
         case (let l?, nil):
-            /// Only one eye usable — use it, but note the reduced confidence rather than treating
-            /// a monocular reading as equally reliable as a binocular one.
+            // Only one eye usable — use it, but note the reduced confidence rather than treating
+            // a monocular reading as equally reliable as a binocular one.
             return CombinedGazeReading(
                 horizontalOffset: l.horizontalOffset,
                 verticalOffset: l.verticalOffset,
@@ -285,9 +357,9 @@ private extension GazeDetector {
                 verticalOffset: r.verticalOffset,
                 confidence: r.confidence * 0.75
             )
-        case (let l?, let r?):
+        case let (l?, r?):
             let totalWeight = l.confidence + r.confidence
-            /// Both passed the minUsableConfidence check above, so totalWeight > 0 here — safe to divide.
+            // Both passed the minUsableConfidence check above, so totalWeight > 0 here — safe to divide.
             let horizontal = (l.horizontalOffset * l.confidence + r.horizontalOffset * r.confidence) / totalWeight
             let vertical = (l.verticalOffset * l.confidence + r.verticalOffset * r.confidence) / totalWeight
 
@@ -299,25 +371,40 @@ private extension GazeDetector {
         }
     }
 }
-//MARK: Stage 5
+
+// MARK: Stage 5
+
 private extension GazeDetector {
     func headPose(from face: VNFaceObservation) -> HeadPose {
         let roll = face.roll.map { CGFloat(truncating: $0) }
-        let yaw = face.yaw.map{ CGFloat(truncating: $0) }
-        let pitch = face.pitch.map{ CGFloat(truncating: $0) }
+        let yaw = face.yaw.map { CGFloat(truncating: $0) }
+        let pitch = face.pitch.map { CGFloat(truncating: $0) }
 
         return HeadPose(roll: roll, yaw: yaw, pitch: pitch)
     }
 
-    func gazeEstimate(eyeReading: CombinedGazeReading, pose: HeadPose) -> GazeEstimate {
+    func gazeEstimate(eyeReading: CombinedGazeReading, pose: HeadPose, faceAxis: CGPoint, facePosition: CGPoint) -> GazeEstimate {
         let yawDegrees = (pose.yaw ?? 0) * 180 / .pi
         let pitchDegrees = (pose.pitch ?? 0) * 180 / .pi
 
-        let eyeHorizontalDegrees = eyeReading.horizontalOffset * calibration.eyeHorizontalScale
-        let eyeVerticalDegrees = eyeReading.verticalOffset * calibration.eyeVerticalScale
+        // Eye-in-head angles, along the face's own axes.
+        let eyeYaw = eyeReading.horizontalOffset * calibration.eyeHorizontalScale
+        let eyePitch = eyeReading.verticalOffset * calibration.eyeVerticalScale
 
-        let horizontalAngle = yawDegrees + eyeHorizontalDegrees
-        let verticalAngle = pitchDegrees + eyeVerticalDegrees
+        // Rotate them into image axes before adding head yaw/pitch, which
+        // describe the head relative to the camera. With the head tilted by
+        // θ, the face's axes are rotated by θ against the screen: looking
+        // straight down at the screen reads as partly sideways along the eye
+        // line, and adding that unrotated mixed the two frames. Upright
+        // (θ = 0) this changes nothing. faceAxis is (cos θ, sin θ).
+        let eyeHorizontal = eyeYaw * faceAxis.x - eyePitch * faceAxis.y
+        let eyeVertical = eyeYaw * faceAxis.y + eyePitch * faceAxis.x
+
+        // Vision's yaw/pitch are taken as already camera-relative and added
+        // as-is. If their sign or scale doesn't match the eye angles, the
+        // calibration's separate head-pose terms absorb it.
+        let horizontalAngle = yawDegrees + eyeHorizontal
+        let verticalAngle = pitchDegrees + eyeVertical
 
         var confidence = eyeReading.confidence
         if pose.yaw == nil { confidence *= 0.85 }
@@ -326,17 +413,19 @@ private extension GazeDetector {
         return GazeEstimate(
             horizontalAngle: horizontalAngle,
             verticalAngle: verticalAngle,
-            confidence: confidence
+            confidence: confidence,
+            head: HeadPlacement(yaw: yawDegrees, pitch: pitchDegrees, position: facePosition)
         )
     }
 }
 
-//MARK: Stage 8
+// MARK: Stage 8
+
 private extension GazeDetector {
     func emit(_ observation: GazeObservation) {
-        /// Task { @MainActor in } gives the compiler an actual, provable guarantee that
-        /// this hop lands on the main actor before `callback` runs — unlike DispatchQueue.main.async,
-        /// which is only a runtime convention as far as the type system is concerned.
+        // Task { @MainActor in } gives the compiler an actual, provable guarantee that
+        // this hop lands on the main actor before `callback` runs — unlike DispatchQueue.main.async,
+        // which is only a runtime convention as far as the type system is concerned.
         let callback = onObservation
         Task { @MainActor in
             callback?(observation)

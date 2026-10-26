@@ -11,6 +11,6 @@ struct EyeReading: Equatable {
     /// Signed offset along the perpendicular axis, roughly -1...+1.
     let verticalOffset: CGFloat
 
-    /// 0...1 — lower when the eye looks closed/occluded (see EAR below).
+    /// 0...1 — lower when the eye looks closed/occluded (see GazeDetector.eyeOpenness).
     let confidence: Double
 }

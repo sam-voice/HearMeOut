@@ -113,7 +113,7 @@ struct TutorialView: View {
                 tint: .green,
                 steps: [
                     "Look toward the camera as you answer naturally.",
-                    "Review your feedback and try again whenever you like."
+                    "Review your feedback and try again whenever you like.",
                 ],
                 buttonTitle: "Start interview practice"
             )
@@ -124,7 +124,7 @@ struct TutorialView: View {
                 iconName: "book.closed.fill",
                 tint: .yellow,
                 steps: [
-                    "Read aloud in your natural voice."
+                    "Read aloud in your natural voice.",
                 ],
                 buttonTitle: "Start reading practice"
             )

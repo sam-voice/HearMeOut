@@ -1,5 +1,5 @@
 //
-//  SwiftUIView.swift
+//  ButtonView.swift
 //  HearMeOut
 //
 //  Created by Sukhrob on 10/09/26.
@@ -51,4 +51,3 @@ struct ButtonView: View {
         .buttonStyle(.plain)
     }
 }
-

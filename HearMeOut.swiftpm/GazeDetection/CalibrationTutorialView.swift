@@ -22,7 +22,7 @@ final class CalibrationTutorialView: UIView {
         title.textColor = .white
 
         let instructions = UILabel()
-        instructions.text = "Keep your face in frame. A dot will move to five positions. Look at each dot and hold your gaze until it moves again."
+        instructions.text = "Keep your face in frame. A dot will move to five positions. Look at each dot and hold your gaze until it moves again. Then keep looking at the center dot while you slowly tilt and turn your head."
         instructions.font = .preferredFont(forTextStyle: .body)
         instructions.textColor = .white
         instructions.numberOfLines = 0
@@ -51,11 +51,13 @@ final class CalibrationTutorialView: UIView {
             stack.leadingAnchor.constraint(equalTo: card.contentView.leadingAnchor, constant: 24),
             stack.trailingAnchor.constraint(equalTo: card.contentView.trailingAnchor, constant: -24),
             stack.bottomAnchor.constraint(equalTo: card.contentView.bottomAnchor, constant: -28),
-            card.widthAnchor.constraint(lessThanOrEqualToConstant: 420)
+            card.widthAnchor.constraint(lessThanOrEqualToConstant: 420),
         ])
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    required init?(coder _: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
     @objc private func startTapped() {
         onStartTapped?()

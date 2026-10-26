@@ -3,7 +3,7 @@
 
 import Foundation
 
-enum GazeZone: Equatable, Sendable {
+enum GazeZone: Equatable {
     case center
     case left
     case right

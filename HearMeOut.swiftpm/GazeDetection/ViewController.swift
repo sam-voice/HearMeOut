@@ -1,21 +1,21 @@
 //  Created by Sukhrob on 25/08/26.
 //
 
-import UIKit
 import AVFoundation
 import SwiftUI
+import UIKit
 
 class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate {
-    nonisolated(unsafe) private var permissionGranted = false
-    
-    nonisolated(unsafe) private let captureSession = AVCaptureSession()
+    private nonisolated(unsafe) var permissionGranted = false
+
+    private nonisolated(unsafe) let captureSession = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "sessionQueue")
-    
-    nonisolated(unsafe) private var previewLayer = AVCaptureVideoPreviewLayer()
-    
+
+    private nonisolated(unsafe) var previewLayer = AVCaptureVideoPreviewLayer()
+
     /// Detector
-    nonisolated(unsafe) private var videoOutput = AVCaptureVideoDataOutput()
-    nonisolated(unsafe) private let gazeDetector = GazeDetector()
+    private nonisolated(unsafe) var videoOutput = AVCaptureVideoDataOutput()
+    private nonisolated(unsafe) let gazeDetector = GazeDetector()
     private var boundaryEvaluator: GazeBoundaryEvaluator?
     private let calibrationCoordinator = CalibrationCoordinator()
     private var calibrationTargetView: CalibrationTargetView?
@@ -27,7 +27,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var feedbackView: EyeContactFeedbackView?
 
     private let liveConfidenceThreshold = 0.6
-    
+
     override func viewDidLoad() {
         super.viewDidLoad()
         gazeDetector.onObservation = { [weak self] observation in
@@ -35,12 +35,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         }
         installFeedbackUI()
         checkPermission()
-        
+
         sessionQueue.async { [unowned self] in
             guard permissionGranted else { return }
             self.setUpCaptureSession()
             self.captureSession.startRunning()
-            
+
             // Signal readiness back on main — same hop already used
             // below for adding the preview layer.
             DispatchQueue.main.async { [weak self] in
@@ -48,7 +48,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             }
         }
     }
-    
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         hasAppeared = true
@@ -76,7 +76,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         view.addSubview(tutorial)
         tutorialView = tutorial
     }
-    
+
     nonisolated func checkPermission() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -87,7 +87,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             permissionGranted = false
         }
     }
-    
+
     nonisolated func requestPermission() {
         sessionQueue.suspend()
         AVCaptureDevice.requestAccess(for: .video) { [unowned self] granted in
@@ -99,21 +99,21 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     nonisolated func setUpCaptureSession() {
         guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else { return }
         guard let videoDeviceInput = try? AVCaptureDeviceInput(device: videoDevice) else { return }
-        
+
         guard captureSession.canAddInput(videoDeviceInput) else { return }
         captureSession.addInput(videoDeviceInput)
-        
+
         previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
         previewLayer.videoGravity = AVLayerVideoGravity.resizeAspectFill
-        
+
         previewLayer.connection?.videoRotationAngle = 0
-        
+
         videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "sampleBufferQueue"))
         guard captureSession.canAddOutput(videoOutput) else { return }
         captureSession.addOutput(videoOutput)
-        
+
         videoOutput.connection(with: .video)?.videoRotationAngle = 0
-        
+
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.previewLayer.frame = self.view.bounds
@@ -122,27 +122,27 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.view.layer.insertSublayer(self.previewLayer, at: 0)
         }
     }
-    
-    nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+
+    nonisolated func captureOutput(_: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from _: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         gazeDetector.handle(pixelBuffer)
     }
-    
+
     private func handleGazeObservation(_ observation: GazeObservation) {
         switch observation {
-        case .detected(let reading):
+        case let .detected(reading):
             if isCalibrating {
                 feedbackView?.setState(.calibrating)
                 calibrationCoordinator.handle(reading, timestamp: reading.timestamp)
                 return
             }
-            
-            guard let evaluator = boundaryEvaluator else { return }  // calibration not run yet
+
+            guard let evaluator = boundaryEvaluator else { return } // calibration not run yet
             guard reading.confidence >= liveConfidenceThreshold else {
                 feedbackView?.setState(.lowConfidence)
                 return
             }
-            
+
             switch evaluator.evaluate(reading, viewBounds: view.bounds) {
             case .withinBounds:
                 feedbackView?.setState(.eyeContact)
@@ -152,12 +152,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         case .noFace:
             feedbackView?.setState(.noFace)
             if isCalibrating {
-                calibrationCoordinator.faceLost()
+                // Same clock GazeDetector stamps readings with.
+                calibrationCoordinator.faceLost(at: CACurrentMediaTime())
             }
         }
     }
 }
-    
+
 private extension ViewController {
     func installFeedbackUI() {
         let feedback = EyeContactFeedbackView(frame: view.bounds)
@@ -187,14 +188,16 @@ private extension ViewController {
 
         let inset: CGFloat = 60
         let bounds = view.bounds.insetBy(dx: inset, dy: inset)
-        // Four corners for the actual fit, plus a center point held back
-        // purely to sanity-check accuracy afterward.
-        let targets = [
-            CGPoint(x: bounds.minX, y: bounds.minY),
-            CGPoint(x: bounds.maxX, y: bounds.minY),
-            CGPoint(x: bounds.minX, y: bounds.maxY),
-            CGPoint(x: bounds.maxX, y: bounds.maxY),
-            CGPoint(x: bounds.midX, y: bounds.midY)
+        // Four corners plus the center, then a head-motion step on the
+        // center dot; all of them feed the calibration fit.
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let targets: [CalibrationCoordinator.Target] = [
+            .fixation(at: CGPoint(x: bounds.minX, y: bounds.minY)),
+            .fixation(at: CGPoint(x: bounds.maxX, y: bounds.minY)),
+            .fixation(at: CGPoint(x: bounds.minX, y: bounds.maxY)),
+            .fixation(at: CGPoint(x: bounds.maxX, y: bounds.maxY)),
+            .fixation(at: center),
+            .headMotion(at: center),
         ]
 
         let targetView = CalibrationTargetView(frame: view.bounds)
@@ -204,8 +207,9 @@ private extension ViewController {
 
         feedbackView?.setState(.calibrating)
 
-        calibrationCoordinator.onTargetChanged = { [weak self] point in
-            self?.calibrationTargetView?.move(to: point, animated: true)
+        calibrationCoordinator.onTargetChanged = { [weak self] target in
+            self?.calibrationTargetView?.move(to: target.point, animated: true)
+            self?.calibrationTargetView?.setInstruction(target.instruction)
         }
         calibrationCoordinator.onCollectingChanged = { [weak self] collecting in
             self?.calibrationTargetView?.setCollecting(collecting)
@@ -217,7 +221,7 @@ private extension ViewController {
             self.isCalibrating = false
 
             switch result {
-            case .success(let calibration):
+            case let .success(calibration):
                 self.boundaryEvaluator = GazeBoundaryEvaluator(calibration: calibration)
                 self.feedbackView?.setState(.eyeContact)
             case .timedOut:
@@ -235,11 +239,9 @@ private extension ViewController {
 }
 
 struct HostedViewController: UIViewControllerRepresentable {
-    func makeUIViewController(context: Context) -> some UIViewController {
+    func makeUIViewController(context _: Context) -> some UIViewController {
         return ViewController()
     }
 
-    func updateUIViewController(_ uiViewController: UIViewControllerType, context: Context) {
-
-    }
+    func updateUIViewController(_: UIViewControllerType, context _: Context) {}
 }

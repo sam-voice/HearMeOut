@@ -7,5 +7,7 @@ struct ActionButton<Action: ActionType>: Identifiable, Equatable {
     let model: ButtonModel
     let action: Action
 
-    var id: String { model.id }
+    var id: String {
+        model.id
+    }
 }

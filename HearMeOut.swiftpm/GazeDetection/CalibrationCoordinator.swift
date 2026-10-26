@@ -4,7 +4,6 @@
 import CoreGraphics
 
 final class CalibrationCoordinator {
-
     enum Result {
         case success(GazeScreenCalibration)
         case timedOut
@@ -19,30 +18,59 @@ final class CalibrationCoordinator {
         case failed
     }
 
+    struct Target {
+        let point: CGPoint
+        /// Once settled, keep collecting readings for this long; every
+        /// reading becomes a calibration sample.
+        let collectDuration: CFTimeInterval
+        /// Shown to the user while this target is active.
+        let instruction: String?
+        /// A fixation target restarts after face loss, since the user may
+        /// have looked away. The head-motion target keeps what it has:
+        /// turning the head is expected to drop the face now and then.
+        let restartsOnFaceLoss: Bool
+
+        static func fixation(at point: CGPoint) -> Target {
+            Target(point: point, collectDuration: 0.6, instruction: nil, restartsOnFaceLoss: true)
+        }
+
+        /// The user keeps looking at `point` while slowly moving their head,
+        /// so calibration sees varied head poses for one known gaze target
+        /// (Lu et al., BMVC 2011). Without this, the head-pose terms in
+        /// `GazeScreenCalibration` have nothing to learn from.
+        static func headMotion(at point: CGPoint) -> Target {
+            Target(
+                point: point,
+                collectDuration: 4.0,
+                instruction: "Keep looking at the dot\nand slowly tilt and turn your head",
+                restartsOnFaceLoss: false
+            )
+        }
+    }
+
     private(set) var state: State = .idle
-    private var targets: [CGPoint] = []
+    private var targets: [Target] = []
     private var currentIndex = 0
     private let session = CalibrationSession()
 
     /// Ignore readings for this long after a new target appears — filters
     /// out the transition while eyes are still moving toward the dot.
     private let settleDuration: CFTimeInterval = 0.4
-    /// Once settled, keep collecting readings for this long, then average
-    /// them into the point's final sample.
-    private let collectDuration: CFTimeInterval = 0.6
-    /// If a point can't gather enough readings within this long overall
-    /// (e.g. repeated face loss), bail out rather than stalling forever.
-    private let perPointTimeout: CFTimeInterval = 4.0
+    /// A target normally completes in settle + collect. If it hasn't within
+    /// this much extra time — face out of frame, or detection flickering so
+    /// the target keeps restarting — fail instead of stalling forever: the
+    /// user has no other way out while calibration is running.
+    private let timeoutSlack: CFTimeInterval = 3.0
 
     private var phaseStartTime: CFTimeInterval?
     private var pointStartTime: CFTimeInterval?
     private var collectedReadings: [GazeReading] = []
 
-    var onTargetChanged: ((CGPoint) -> Void)?
+    var onTargetChanged: ((Target) -> Void)?
     var onCollectingChanged: ((Bool) -> Void)?
     var onFinished: ((Result) -> Void)?
 
-    func begin(targets: [CGPoint]) {
+    func begin(targets: [Target]) {
         session.reset()
         self.targets = targets
         currentIndex = 0
@@ -68,27 +96,22 @@ final class CalibrationCoordinator {
     }
 
     /// Feed every GazeReading here while calibration is running. Call
-    /// `faceLost()` instead when an observation comes back as `.noFace`.
+    /// `faceLost(at:)` instead when an observation comes back as `.noFace`.
     func handle(_ reading: GazeReading, timestamp: CFTimeInterval) {
-        if pointStartTime == nil { pointStartTime = timestamp }
-        if let pointStart = pointStartTime, timestamp - pointStart > perPointTimeout {
-            state = .failed
-            onFinished?(.timedOut)
-            return
-        }
+        guard !hasTimedOut(at: timestamp) else { return }
 
         switch state {
-        case .awaitingStability(let index):
+        case let .awaitingStability(index):
             if phaseStartTime == nil { phaseStartTime = timestamp }
             guard let start = phaseStartTime, timestamp - start >= settleDuration else { return }
             state = .collecting(pointIndex: index)
             phaseStartTime = timestamp
             onCollectingChanged?(true)
 
-        case .collecting(let index):
+        case let .collecting(index):
             collectedReadings.append(reading)
-            guard let start = phaseStartTime, timestamp - start >= collectDuration else { return }
-            recordAveragedSample(pointIndex: index)
+            guard let start = phaseStartTime, timestamp - start >= targets[index].collectDuration else { return }
+            recordSamples(pointIndex: index)
             currentIndex += 1
             moveToCurrentTarget()
 
@@ -97,48 +120,62 @@ final class CalibrationCoordinator {
         }
     }
 
-    /// Call when the Detector reports `.noFace` while calibrating — a
-    /// gap here means whatever's been collected so far for this point is
-    /// unreliable, so restart its settle phase rather than quietly
-    /// averaging across a dropout.
-    func faceLost() {
+    /// Call when the Detector reports `.noFace` while calibrating — for a
+    /// fixation target, a gap here means whatever's been collected so far
+    /// is unreliable, so restart its settle phase rather than quietly
+    /// keeping readings from either side of a dropout.
+    func faceLost(at timestamp: CFTimeInterval) {
+        guard !hasTimedOut(at: timestamp) else { return }
+
         switch state {
-        case .awaitingStability(let index), .collecting(let index):
+        case let .awaitingStability(index), let .collecting(index):
+            guard targets[index].restartsOnFaceLoss else { return }
             resetCurrentPoint(index: index)
         case .idle, .finished, .failed:
             return
         }
     }
 
+    /// Leaves `pointStartTime` alone on purpose: the timeout measures how
+    /// long the target has been showing, so face loss mustn't restart it.
     private func resetCurrentPoint(index: Int) {
         state = .awaitingStability(pointIndex: index)
         phaseStartTime = nil
-        pointStartTime = nil
         collectedReadings = []
         onCollectingChanged?(false)
     }
 
-    private func recordAveragedSample(pointIndex: Int) {
-        guard !collectedReadings.isEmpty else { return }
-        let reading = GazeReading(
-            gaze: .center, // unused for calibration fitting
-            horizontalAngle: median(collectedReadings.map(\.horizontalAngle)),
-            verticalAngle: median(collectedReadings.map(\.verticalAngle)),
-            confidence: collectedReadings.map(\.confidence).reduce(0, +) / Double(collectedReadings.count),
-            timeSinceCentered: nil,
-            timestamp: 0
-        )
-        session.recordSample(at: targets[pointIndex], reading: reading)
-    }
-
-    func median(_ values: [CGFloat]) -> CGFloat {
-        let sorted = values.sorted()
-        let middle = sorted.count / 2
-
-        if sorted.count.isMultiple(of: 2) {
-            return (sorted[middle - 1] + sorted[middle]) / 2
+    /// Starts the current target's clock on its first event and fails the
+    /// calibration once that target has been showing too long. Checked on
+    /// face loss as well as on readings — with the face fully out of frame,
+    /// `.noFace` is the only event that arrives.
+    private func hasTimedOut(at timestamp: CFTimeInterval) -> Bool {
+        let index: Int
+        switch state {
+        case let .awaitingStability(i), let .collecting(i):
+            index = i
+        case .idle, .finished, .failed:
+            return false
         }
 
-        return sorted[middle]
+        guard let pointStart = pointStartTime else {
+            pointStartTime = timestamp
+            return false
+        }
+        let timeout = settleDuration + targets[index].collectDuration + timeoutSlack
+        guard timestamp - pointStart > timeout else { return false }
+
+        state = .failed
+        onFinished?(.timedOut)
+        return true
+    }
+
+    /// Every reading becomes its own sample rather than being reduced to one
+    /// median per target: the fit now has six features to learn, and the
+    /// head-motion target only helps if its varied head poses survive.
+    private func recordSamples(pointIndex: Int) {
+        for reading in collectedReadings {
+            session.recordSample(at: targets[pointIndex].point, reading: reading)
+        }
     }
 }

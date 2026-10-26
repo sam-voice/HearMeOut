@@ -2,8 +2,8 @@
 //
 
 import AVFoundation
-import Speech
 import Observation
+import Speech
 
 public actor SpeechRecognizer: Observable {
     public enum RecognizerError: Error {
@@ -80,7 +80,7 @@ public actor SpeechRecognizer: Observable {
      */
     private func transcribe() {
         guard let recognizer, recognizer.isAvailable else {
-            self.transcribe(RecognizerError.recognizerIsUnavailable)
+            transcribe(RecognizerError.recognizerIsUnavailable)
             return
         }
 
@@ -88,12 +88,12 @@ public actor SpeechRecognizer: Observable {
             let (audioEngine, request) = try Self.prepareEngine()
             self.audioEngine = audioEngine
             self.request = request
-            self.task = recognizer.recognitionTask(with: request, resultHandler: { [weak self] result, error in
+            task = recognizer.recognitionTask(with: request, resultHandler: { [weak self] result, error in
                 self?.recognitionHandler(audioEngine: audioEngine, result: result, error: error)
             })
         } catch {
-            self.reset()
-            self.transcribe(error)
+            reset()
+            transcribe(error)
         }
     }
 
@@ -118,7 +118,7 @@ public actor SpeechRecognizer: Observable {
         let inputNode = audioEngine.inputNode
 
         let recordingFormat = inputNode.outputFormat(forBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer: AVAudioPCMBuffer, _: AVAudioTime) in
             request.append(buffer)
         }
         audioEngine.prepare()
@@ -127,7 +127,7 @@ public actor SpeechRecognizer: Observable {
         return (audioEngine, request)
     }
 
-    nonisolated private func recognitionHandler(audioEngine: AVAudioEngine, result: SFSpeechRecognitionResult?, error: Error?) {
+    private nonisolated func recognitionHandler(audioEngine: AVAudioEngine, result: SFSpeechRecognitionResult?, error: Error?) {
         let receivedFinalResult = result?.isFinal ?? false
         let receivedError = error != nil
 
@@ -141,13 +141,13 @@ public actor SpeechRecognizer: Observable {
         }
     }
 
-
-    nonisolated private func transcribe(_ message: String) {
+    private nonisolated func transcribe(_ message: String) {
         Task { @MainActor in
             transcript = message
         }
     }
-    nonisolated private func transcribe(_ error: Error) {
+
+    private nonisolated func transcribe(_ error: Error) {
         var errorMessage = ""
         if let error = error as? RecognizerError {
             errorMessage += error.message
@@ -180,8 +180,7 @@ extension AVAudioSession {
     }
 }
 
-
-//extension Recorder {
+// extension Recorder {
 //    func transcribeAudioToText() async throws {
 //        let transcriber = SpeechTranscriber(locale: .init(identifier: "en"), preset: .transcription)
 //        async let transcriptionFuture = try transcriber.results
@@ -197,4 +196,4 @@ extension AVAudioSession {
 //        let text = try await transcriptionFuture
 //        finalizedTranscript = text
 //    }
-//}
+// }

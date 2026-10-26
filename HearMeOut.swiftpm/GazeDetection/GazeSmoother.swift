@@ -1,8 +1,8 @@
 //  Created by Sukhrob on 28/08/26.
 //
 
-import Foundation
 import CoreGraphics
+import Foundation
 
 final class GazeSmoother {
     /// Roughly, how many seconds of recent history meaningfully influence
@@ -19,6 +19,9 @@ final class GazeSmoother {
     private var smoothedHorizontal: CGFloat = 0
     private var smoothedVertical: CGFloat = 0
     private var smoothedConfidence: Double = 0
+    private var smoothedYaw: CGFloat = 0
+    private var smoothedPitch: CGFloat = 0
+    private var smoothedPosition: CGPoint = .zero
     private var lastUpdateTime: CFTimeInterval?
 
     /// Feed one raw estimate in, get the smoothed estimate out.
@@ -36,20 +39,28 @@ final class GazeSmoother {
 
         let alpha = 1 - exp(-dt / timeConstant)
 
-        /// Scale by this frame's confidence: a shaky, low-confidence reading nudges the smoothed angle less than a clean one would.
+        // Scale by this frame's confidence: a shaky, low-confidence reading nudges the smoothed angle less than a clean one would.
         let effectiveAlpha = alpha * estimate.confidence
 
         smoothedHorizontal += (estimate.horizontalAngle - smoothedHorizontal) * effectiveAlpha
         smoothedVertical += (estimate.verticalAngle - smoothedVertical) * effectiveAlpha
 
-        /// Confidence itself is deliberately NOT scaled by its own value here — doing so would
-        /// create a feedback loop where a dip in confidence makes it harder for confidence to ever recover.
+        // Confidence itself is deliberately NOT scaled by its own value here — doing so would
+        // create a feedback loop where a dip in confidence makes it harder for confidence to ever recover.
         smoothedConfidence += (estimate.confidence - smoothedConfidence) * alpha
+
+        // Head placement comes from the whole face, not the eyes, so eye
+        // confidence says nothing about its quality — plain alpha.
+        smoothedYaw += (estimate.head.yaw - smoothedYaw) * alpha
+        smoothedPitch += (estimate.head.pitch - smoothedPitch) * alpha
+        smoothedPosition.x += (estimate.head.position.x - smoothedPosition.x) * alpha
+        smoothedPosition.y += (estimate.head.position.y - smoothedPosition.y) * alpha
 
         return GazeEstimate(
             horizontalAngle: smoothedHorizontal,
             verticalAngle: smoothedVertical,
-            confidence: smoothedConfidence
+            confidence: smoothedConfidence,
+            head: HeadPlacement(yaw: smoothedYaw, pitch: smoothedPitch, position: smoothedPosition)
         )
     }
 
@@ -63,6 +74,9 @@ final class GazeSmoother {
         smoothedHorizontal = estimate.horizontalAngle
         smoothedVertical = estimate.verticalAngle
         smoothedConfidence = estimate.confidence
+        smoothedYaw = estimate.head.yaw
+        smoothedPitch = estimate.head.pitch
+        smoothedPosition = estimate.head.position
         return estimate
     }
 }

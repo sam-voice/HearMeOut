@@ -1,8 +1,8 @@
 //  Created by Sukhrob on 10/09/26.
 //
 
-import Foundation
 import Combine
+import Foundation
 
 protocol HomeViewModelProtocol: ObservableObject {
     var state: HomeState { get }
@@ -29,6 +29,7 @@ struct HomeState: Equatable {
         ),
         ActionButton(
             model: ButtonModel(id: UUID().uuidString, title: "Reading Mode", subtitle: "Read aloud at your own pace", backgroundColor: .yellow, iconSystemName: "book.closed.fill"),
-            action: HomeAction.reading)
+            action: HomeAction.reading
+        ),
     ]
 }

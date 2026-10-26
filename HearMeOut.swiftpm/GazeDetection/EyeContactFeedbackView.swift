@@ -55,13 +55,16 @@ final class EyeContactFeedbackView: UIView {
             statusLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
 
             recalibrateButton.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -16),
-            recalibrateButton.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -16)
+            recalibrateButton.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -16),
         ])
 
         setState(.readyToCalibrate)
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
     override func layoutSubviews() {
         super.layoutSubviews()
@@ -85,7 +88,7 @@ final class EyeContactFeedbackView: UIView {
             details = ("Hold still and face the camera", .systemOrange, true)
         case .noFace:
             details = ("No face found\nMove into the camera frame", .systemOrange, true)
-        case .calibrationFailed(let reason):
+        case let .calibrationFailed(reason):
             details = (reason, .systemRed, false)
         }
 

@@ -1,5 +1,5 @@
 //
-//  SwiftUIView.swift
+//  TranscriberView.swift
 //  HearMeOut
 //
 //  Created by Sukhrob on 13/09/26.
@@ -42,7 +42,7 @@ struct TranscriberView: View {
     }
 }
 
-//struct TranscriberView: View {
+// struct TranscriberView: View {
 //    @State var speechRecognizer = SpeechRecognizer()
 //    @State private var isRecording = false
 //
@@ -67,4 +67,4 @@ struct TranscriberView: View {
 //        .padding()
 //        .navigationBarTitleDisplayMode(.inline)
 //    }
-//}
+// }

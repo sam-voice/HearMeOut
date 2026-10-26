@@ -1,5 +1,5 @@
-import SwiftUI
 import Observation
+import SwiftUI
 
 enum AppRoute: Hashable, Identifiable {
     case home
@@ -8,7 +8,9 @@ enum AppRoute: Hashable, Identifiable {
     case readingMode
     case result(String)
 
-    var id: Self { self }
+    var id: Self {
+        self
+    }
 }
 
 @Observable

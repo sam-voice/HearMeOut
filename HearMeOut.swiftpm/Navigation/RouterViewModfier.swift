@@ -10,15 +10,15 @@ struct RouterViewModfier: ViewModifier {
         Group {
             switch route {
             case .home:
-                VStack{}
-            case .tutorial(let type):
+                VStack {}
+            case let .tutorial(type):
                 TutorialView(type: type)
             case .interviewMode:
                 ContentView()
             case .readingMode:
                 TranscriberView()
-            case .result(let string):
-                VStack{}
+            case let .result(string):
+                VStack {}
             }
         }
         .environment(router)
